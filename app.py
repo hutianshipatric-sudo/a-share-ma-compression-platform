@@ -17,8 +17,8 @@ st.caption("CSV上传版：因子分析、分桶成功率、Logistic回归、Ran
 st.sidebar.header("策略参数")
 
 compression_threshold = st.sidebar.slider("均线粘合度阈值", 0.01, 0.15, 0.08, 0.005)
-volume_multiplier = st.sidebar.slider("放量倍数", 0.5, 5.0, 1.2, 0.1)
-turnover_threshold = st.sidebar.slider("最低换手率", 0.0, 20.0, 0.0, 0.5)
+volume_reference = st.sidebar.slider("放量参考线", 0.5, 5.0, 1.2, 0.1)
+turnover_reference = st.sidebar.slider("换手率参考线", 0.0, 20.0, 0.0, 0.5)
 future_days = st.sidebar.slider("未来观察天数", 20, 120, 60, 5)
 target_return = st.sidebar.slider("目标涨幅", 0.10, 1.50, 0.50, 0.05)
 
@@ -32,13 +32,26 @@ def load_csv(file):
         df = pd.read_csv(file, encoding="gbk")
 
     rename_map = {
-        "日期": "date", "股票代码": "code", "代码": "code",
-        "股票名称": "name", "名称": "name",
-        "开盘": "open", "最高": "high", "最低": "low", "收盘": "close",
-        "成交量": "volume", "成交额": "amount", "换手率": "turnover",
-        "振幅": "amplitude", "涨跌幅": "pct_change",
-        "Date": "date", "Open": "open", "High": "high",
-        "Low": "low", "Close": "close", "Volume": "volume"
+        "日期": "date",
+        "股票代码": "code",
+        "代码": "code",
+        "股票名称": "name",
+        "名称": "name",
+        "开盘": "open",
+        "最高": "high",
+        "最低": "low",
+        "收盘": "close",
+        "成交量": "volume",
+        "成交额": "amount",
+        "换手率": "turnover",
+        "振幅": "amplitude",
+        "涨跌幅": "pct_change",
+        "Date": "date",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Volume": "volume",
     }
 
     df = df.rename(columns=rename_map)
@@ -65,7 +78,10 @@ def load_csv(file):
     df["date"] = pd.to_datetime(df["date"])
     df["code"] = df["code"].astype(str).str.replace(".0", "", regex=False).str.zfill(6)
 
-    num_cols = ["open", "high", "low", "close", "volume", "turnover", "amplitude", "pct_change"]
+    num_cols = [
+        "open", "high", "low", "close", "volume",
+        "turnover", "amplitude", "pct_change"
+    ]
 
     for col in num_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -80,7 +96,9 @@ def calculate_indicators(df):
     df = df.copy()
 
     for ma in [5, 10, 20, 30, 60, 120]:
-        df[f"MA{ma}"] = df.groupby("code")["close"].transform(lambda x: x.rolling(ma).mean())
+        df[f"MA{ma}"] = df.groupby("code")["close"].transform(
+            lambda x: x.rolling(ma).mean()
+        )
 
     ma_cols = ["MA5", "MA10", "MA20", "MA30", "MA60"]
 
@@ -88,22 +106,30 @@ def calculate_indicators(df):
     df["ma_min"] = df[ma_cols].min(axis=1)
     df["compression"] = (df["ma_max"] - df["ma_min"]) / df["close"]
 
-    df["volume_ma20"] = df.groupby("code")["volume"].transform(lambda x: x.rolling(20).mean())
+    df["volume_ma20"] = df.groupby("code")["volume"].transform(
+        lambda x: x.rolling(20).mean()
+    )
     df["volume_ratio"] = df["volume"] / df["volume_ma20"]
 
     df["return_5d"] = df.groupby("code")["close"].pct_change(5)
     df["return_10d"] = df.groupby("code")["close"].pct_change(10)
     df["return_20d"] = df.groupby("code")["close"].pct_change(20)
 
-    df["volatility_20d"] = df.groupby("code")["pct_change"].transform(lambda x: x.rolling(20).std())
+    df["volatility_20d"] = df.groupby("code")["pct_change"].transform(
+        lambda x: x.rolling(20).std()
+    )
 
     df["price_vs_ma60"] = df["close"] / df["MA60"] - 1
     df["price_vs_ma120"] = df["close"] / df["MA120"] - 1
 
     df["break_ma60"] = df["close"] > df["MA60"]
 
-    df["rolling_20_high"] = df.groupby("code")["high"].transform(lambda x: x.rolling(20).max())
-    df["rolling_60_high"] = df.groupby("code")["high"].transform(lambda x: x.rolling(60).max())
+    df["rolling_20_high"] = df.groupby("code")["high"].transform(
+        lambda x: x.rolling(20).max()
+    )
+    df["rolling_60_high"] = df.groupby("code")["high"].transform(
+        lambda x: x.rolling(60).max()
+    )
 
     df["break_20d_high"] = df["close"] >= df["rolling_20_high"]
     df["break_60d_high"] = df["close"] >= df["rolling_60_high"]
@@ -176,7 +202,7 @@ def bucket_analysis(df, factor, bins):
     temp = df.copy()
     temp[f"{factor}_bucket"] = pd.cut(temp[factor], bins=bins)
 
-    result = temp.groupby(f"{factor}_bucket").agg(
+    result = temp.groupby(f"{factor}_bucket", observed=False).agg(
         样本数量=("success", "count"),
         成功数量=("success", "sum"),
         平均未来涨幅=("future_return", "mean"),
@@ -203,8 +229,6 @@ df = calculate_indicators(raw_df)
 
 condition = (
     (df["compression"] <= compression_threshold) &
-    (df["volume_ratio"] >= volume_multiplier) &
-    (df["turnover"] >= turnover_threshold) &
     (df["break_ma60"]) &
     (df["break_20d_high"])
 )
@@ -212,11 +236,14 @@ condition = (
 events = df[condition].copy()
 
 if events.empty:
-    st.warning("没有扫描到符合条件的历史事件，可以放宽左侧参数。")
+    st.warning("没有扫描到符合条件的历史事件，可以放宽左侧均线粘合度阈值。")
     st.stop()
 
 events["compression_level"] = events["compression"].apply(classify_compression)
 events["score"] = events.apply(calculate_score, axis=1)
+
+events["是否高于放量参考线"] = events["volume_ratio"] >= volume_reference
+events["是否高于换手率参考线"] = events["turnover"] >= turnover_reference
 
 feature_cols = [
     "compression",
@@ -240,12 +267,16 @@ st.subheader("一、事件研究结果")
 final_cols = [
     "date", "code", "name", "close",
     "compression", "compression_level",
-    "volume_ratio", "turnover", "amplitude",
-    "pct_change", "return_20d", "volatility_20d",
+    "volume_ratio", "是否高于放量参考线",
+    "turnover", "是否高于换手率参考线",
+    "amplitude", "pct_change", "return_20d", "volatility_20d",
     "future_return", "success", "score"
 ]
 
-final_df = events[final_cols].sort_values(["score", "future_return"], ascending=False)
+final_df = events[final_cols].sort_values(
+    ["score", "future_return"],
+    ascending=False
+)
 
 col1, col2, col3 = st.columns(3)
 col1.metric("事件总数", len(final_df))
@@ -299,22 +330,41 @@ st.plotly_chart(fig, use_container_width=True)
 st.subheader("三、因子相关性分析")
 
 if len(events_model) >= 10:
-    corr_df = events_model[feature_cols + ["future_return"]].corr(method="spearman")["future_return"]
-    corr_df = corr_df.drop("future_return").sort_values(ascending=False).reset_index()
+    corr_df = (
+        events_model[feature_cols + ["future_return"]]
+        .corr(method="spearman")["future_return"]
+        .drop("future_return")
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+
     corr_df.columns = ["因子", "Spearman相关性"]
 
     st.dataframe(corr_df, use_container_width=True)
 
     fig_corr = go.Figure()
-    fig_corr.add_trace(go.Bar(x=corr_df["因子"], y=corr_df["Spearman相关性"]))
-    fig_corr.update_layout(height=450, title="因子与未来60日最大涨幅 Spearman相关性")
+    fig_corr.add_trace(go.Bar(
+        x=corr_df["因子"],
+        y=corr_df["Spearman相关性"]
+    ))
+    fig_corr.update_layout(
+        height=450,
+        title="因子与未来60日最大涨幅 Spearman相关性"
+    )
     st.plotly_chart(fig_corr, use_container_width=True)
+
 else:
     st.warning("样本量太少，暂不建议看相关性。至少需要10个事件。")
 
 st.subheader("四、分桶成功率分析")
 
-tab1, tab2, tab3, tab4 = st.tabs(["粘合度", "放量倍数", "振幅", "20日动量"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "粘合度",
+    "放量倍数",
+    "换手率",
+    "振幅",
+    "20日动量"
+])
 
 with tab1:
     result = bucket_analysis(
@@ -328,11 +378,19 @@ with tab2:
     result = bucket_analysis(
         events_model,
         "volume_ratio",
-        bins=[0, 1, 1.5, 2, 3, 5, 100]
+        bins=[0, 1, 1.2, 1.5, 2, 3, 5, 100]
     )
     st.dataframe(result, use_container_width=True)
 
 with tab3:
+    result = bucket_analysis(
+        events_model,
+        "turnover",
+        bins=[-0.01, 0.01, 1, 3, 5, 8, 12, 20, 100]
+    )
+    st.dataframe(result, use_container_width=True)
+
+with tab4:
     result = bucket_analysis(
         events_model,
         "amplitude",
@@ -340,7 +398,7 @@ with tab3:
     )
     st.dataframe(result, use_container_width=True)
 
-with tab4:
+with tab5:
     result = bucket_analysis(
         events_model,
         "return_20d",
@@ -348,14 +406,62 @@ with tab4:
     )
     st.dataframe(result, use_container_width=True)
 
-st.subheader("五、建模分析")
+st.subheader("五、参考线分组分析")
+
+col_a, col_b = st.columns(2)
+
+with col_a:
+    vol_ref_df = events_model.copy()
+    vol_ref_df["放量参考分组"] = np.where(
+        vol_ref_df["volume_ratio"] >= volume_reference,
+        "高于放量参考线",
+        "低于放量参考线"
+    )
+
+    vol_summary = vol_ref_df.groupby("放量参考分组").agg(
+        样本数量=("success", "count"),
+        成功数量=("success", "sum"),
+        平均未来涨幅=("future_return", "mean"),
+        中位数未来涨幅=("future_return", "median")
+    ).reset_index()
+
+    vol_summary["成功率"] = vol_summary["成功数量"] / vol_summary["样本数量"]
+
+    st.write("放量参考线分析")
+    st.dataframe(vol_summary, use_container_width=True)
+
+with col_b:
+    turnover_ref_df = events_model.copy()
+    turnover_ref_df["换手率参考分组"] = np.where(
+        turnover_ref_df["turnover"] >= turnover_reference,
+        "高于换手率参考线",
+        "低于换手率参考线"
+    )
+
+    turnover_summary = turnover_ref_df.groupby("换手率参考分组").agg(
+        样本数量=("success", "count"),
+        成功数量=("success", "sum"),
+        平均未来涨幅=("future_return", "mean"),
+        中位数未来涨幅=("future_return", "median")
+    ).reset_index()
+
+    turnover_summary["成功率"] = turnover_summary["成功数量"] / turnover_summary["样本数量"]
+
+    st.write("换手率参考线分析")
+    st.dataframe(turnover_summary, use_container_width=True)
+
+st.subheader("六、建模分析")
 
 if len(events_model) >= 30 and events_model["success_int"].nunique() == 2:
     X = events_model[feature_cols]
     y = events_model["success_int"]
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.30, random_state=42, stratify=y
+        X,
+        y,
+        test_size=0.30,
+        random_state=42,
+        stratify=y
     )
 
     scaler = StandardScaler()
@@ -406,14 +512,20 @@ if len(events_model) >= 30 and events_model["success_int"].nunique() == 2:
         st.dataframe(importance_df, use_container_width=True)
 
         fig_imp = go.Figure()
-        fig_imp.add_trace(go.Bar(x=importance_df["因子"], y=importance_df["重要性"]))
-        fig_imp.update_layout(height=450, title="Random Forest 因子重要性")
+        fig_imp.add_trace(go.Bar(
+            x=importance_df["因子"],
+            y=importance_df["重要性"]
+        ))
+        fig_imp.update_layout(
+            height=450,
+            title="Random Forest 因子重要性"
+        )
         st.plotly_chart(fig_imp, use_container_width=True)
 
 else:
     st.warning("建模样本不足。至少需要30个事件，并且成功/失败样本都要有。")
 
-st.subheader("六、Top 20 候选事件")
+st.subheader("七、Top 20 候选事件")
 
 st.dataframe(final_df.head(20), use_container_width=True)
 
