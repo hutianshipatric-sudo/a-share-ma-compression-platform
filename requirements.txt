@@ -1,7 +1,5 @@
 streamlit
-akshare
 pandas
 numpy
 plotly
 scikit-learn
-tqdm
