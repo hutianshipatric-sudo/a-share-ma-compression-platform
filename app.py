@@ -3,10 +3,16 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="A股均线粘合选股平台 V3", layout="wide")
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score
 
-st.title("A股均线粘合突破选股平台 V3")
-st.caption("CSV上传版：识别均线粘合、放量突破、统计未来60日是否涨幅超过50%。")
+st.set_page_config(page_title="A股均线粘合选股平台 V4", layout="wide")
+
+st.title("A股均线粘合突破选股平台 V4")
+st.caption("CSV上传版：因子分析、分桶成功率、Logistic回归、Random Forest因子重要性、Top20候选股。")
 
 st.sidebar.header("策略参数")
 
@@ -26,26 +32,13 @@ def load_csv(file):
         df = pd.read_csv(file, encoding="gbk")
 
     rename_map = {
-        "日期": "date",
-        "股票代码": "code",
-        "代码": "code",
-        "股票名称": "name",
-        "名称": "name",
-        "开盘": "open",
-        "最高": "high",
-        "最低": "low",
-        "收盘": "close",
-        "成交量": "volume",
-        "成交额": "amount",
-        "换手率": "turnover",
-        "振幅": "amplitude",
-        "涨跌幅": "pct_change",
-        "Date": "date",
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Volume": "volume",
+        "日期": "date", "股票代码": "code", "代码": "code",
+        "股票名称": "name", "名称": "name",
+        "开盘": "open", "最高": "high", "最低": "low", "收盘": "close",
+        "成交量": "volume", "成交额": "amount", "换手率": "turnover",
+        "振幅": "amplitude", "涨跌幅": "pct_change",
+        "Date": "date", "Open": "open", "High": "high",
+        "Low": "low", "Close": "close", "Volume": "volume"
     }
 
     df = df.rename(columns=rename_map)
@@ -87,9 +80,7 @@ def calculate_indicators(df):
     df = df.copy()
 
     for ma in [5, 10, 20, 30, 60, 120]:
-        df[f"MA{ma}"] = df.groupby("code")["close"].transform(
-            lambda x: x.rolling(ma).mean()
-        )
+        df[f"MA{ma}"] = df.groupby("code")["close"].transform(lambda x: x.rolling(ma).mean())
 
     ma_cols = ["MA5", "MA10", "MA20", "MA30", "MA60"]
 
@@ -97,17 +88,25 @@ def calculate_indicators(df):
     df["ma_min"] = df[ma_cols].min(axis=1)
     df["compression"] = (df["ma_max"] - df["ma_min"]) / df["close"]
 
-    df["volume_ma20"] = df.groupby("code")["volume"].transform(
-        lambda x: x.rolling(20).mean()
-    )
+    df["volume_ma20"] = df.groupby("code")["volume"].transform(lambda x: x.rolling(20).mean())
     df["volume_ratio"] = df["volume"] / df["volume_ma20"]
+
+    df["return_5d"] = df.groupby("code")["close"].pct_change(5)
+    df["return_10d"] = df.groupby("code")["close"].pct_change(10)
+    df["return_20d"] = df.groupby("code")["close"].pct_change(20)
+
+    df["volatility_20d"] = df.groupby("code")["pct_change"].transform(lambda x: x.rolling(20).std())
+
+    df["price_vs_ma60"] = df["close"] / df["MA60"] - 1
+    df["price_vs_ma120"] = df["close"] / df["MA120"] - 1
 
     df["break_ma60"] = df["close"] > df["MA60"]
 
-    df["rolling_20_high"] = df.groupby("code")["high"].transform(
-        lambda x: x.rolling(20).max()
-    )
+    df["rolling_20_high"] = df.groupby("code")["high"].transform(lambda x: x.rolling(20).max())
+    df["rolling_60_high"] = df.groupby("code")["high"].transform(lambda x: x.rolling(60).max())
+
     df["break_20d_high"] = df["close"] >= df["rolling_20_high"]
+    df["break_60d_high"] = df["close"] >= df["rolling_60_high"]
 
     df["future_max_close"] = df.groupby("code")["close"].transform(
         lambda x: x.shift(-1).rolling(future_days).max().shift(-(future_days - 1))
@@ -173,6 +172,22 @@ def calculate_score(row):
     return score
 
 
+def bucket_analysis(df, factor, bins):
+    temp = df.copy()
+    temp[f"{factor}_bucket"] = pd.cut(temp[factor], bins=bins)
+
+    result = temp.groupby(f"{factor}_bucket").agg(
+        样本数量=("success", "count"),
+        成功数量=("success", "sum"),
+        平均未来涨幅=("future_return", "mean"),
+        中位数未来涨幅=("future_return", "median")
+    ).reset_index()
+
+    result["成功率"] = result["成功数量"] / result["样本数量"]
+
+    return result
+
+
 if uploaded_file is None:
     st.warning("请先上传 CSV 文件。")
     st.stop()
@@ -186,7 +201,60 @@ st.success(f"CSV加载成功：{len(raw_df)} 行，{raw_df['code'].nunique()} �
 
 df = calculate_indicators(raw_df)
 
-st.subheader("单股分析")
+condition = (
+    (df["compression"] <= compression_threshold) &
+    (df["volume_ratio"] >= volume_multiplier) &
+    (df["turnover"] >= turnover_threshold) &
+    (df["break_ma60"]) &
+    (df["break_20d_high"])
+)
+
+events = df[condition].copy()
+
+if events.empty:
+    st.warning("没有扫描到符合条件的历史事件，可以放宽左侧参数。")
+    st.stop()
+
+events["compression_level"] = events["compression"].apply(classify_compression)
+events["score"] = events.apply(calculate_score, axis=1)
+
+feature_cols = [
+    "compression",
+    "volume_ratio",
+    "turnover",
+    "amplitude",
+    "pct_change",
+    "return_5d",
+    "return_10d",
+    "return_20d",
+    "volatility_20d",
+    "price_vs_ma60",
+    "price_vs_ma120"
+]
+
+events_model = events.dropna(subset=feature_cols + ["success", "future_return"]).copy()
+events_model["success_int"] = events_model["success"].astype(int)
+
+st.subheader("一、事件研究结果")
+
+final_cols = [
+    "date", "code", "name", "close",
+    "compression", "compression_level",
+    "volume_ratio", "turnover", "amplitude",
+    "pct_change", "return_20d", "volatility_20d",
+    "future_return", "success", "score"
+]
+
+final_df = events[final_cols].sort_values(["score", "future_return"], ascending=False)
+
+col1, col2, col3 = st.columns(3)
+col1.metric("事件总数", len(final_df))
+col2.metric("成功事件数", int(final_df["success"].sum()))
+col3.metric("成功率", f"{final_df['success'].mean():.2%}")
+
+st.dataframe(final_df, use_container_width=True)
+
+st.subheader("二、单股K线分析")
 
 stock_options = (
     df[["code", "name"]]
@@ -200,13 +268,11 @@ selected_code = selected_label.split(" - ")[0]
 single_df = df[df["code"] == selected_code].copy()
 latest = single_df.iloc[-1]
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("最新收盘价", round(latest["close"], 2))
-col2.metric("最新粘合度", f"{latest['compression']:.2%}")
-col3.metric("放量倍数", f"{latest['volume_ratio']:.2f}")
-col4.metric("换手率", f"{latest['turnover']:.2f}%")
-
-st.write("当前粘合等级：", classify_compression(latest["compression"]))
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("最新收盘价", round(latest["close"], 2))
+c2.metric("最新粘合度", f"{latest['compression']:.2%}")
+c3.metric("最新放量倍数", f"{latest['volume_ratio']:.2f}")
+c4.metric("最新20日波动率", f"{latest['volatility_20d']:.2f}")
 
 fig = go.Figure()
 
@@ -227,77 +293,135 @@ for ma in [5, 10, 20, 30, 60, 120]:
         name=f"MA{ma}"
     ))
 
-fig.update_layout(
-    height=650,
-    xaxis_rangeslider_visible=False,
-    title=f"{selected_label} 均线粘合走势"
-)
-
+fig.update_layout(height=650, xaxis_rangeslider_visible=False)
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("历史事件扫描")
+st.subheader("三、因子相关性分析")
 
-condition = (
-    (df["compression"] <= compression_threshold) &
-    (df["volume_ratio"] >= volume_multiplier) &
-    (df["turnover"] >= turnover_threshold) &
-    (df["break_ma60"]) &
-    (df["break_20d_high"])
-)
+if len(events_model) >= 10:
+    corr_df = events_model[feature_cols + ["future_return"]].corr(method="spearman")["future_return"]
+    corr_df = corr_df.drop("future_return").sort_values(ascending=False).reset_index()
+    corr_df.columns = ["因子", "Spearman相关性"]
 
-events = df[condition].copy()
+    st.dataframe(corr_df, use_container_width=True)
 
-if events.empty:
-    st.warning("没有扫描到符合条件的历史事件，可以放宽左侧参数。")
-    st.stop()
+    fig_corr = go.Figure()
+    fig_corr.add_trace(go.Bar(x=corr_df["因子"], y=corr_df["Spearman相关性"]))
+    fig_corr.update_layout(height=450, title="因子与未来60日最大涨幅 Spearman相关性")
+    st.plotly_chart(fig_corr, use_container_width=True)
+else:
+    st.warning("样本量太少，暂不建议看相关性。至少需要10个事件。")
 
-events["compression_level"] = events["compression"].apply(classify_compression)
-events["score"] = events.apply(calculate_score, axis=1)
+st.subheader("四、分桶成功率分析")
 
-result_cols = [
-    "date", "code", "name", "close",
-    "compression", "compression_level",
-    "volume_ratio", "turnover", "amplitude",
-    "pct_change", "future_return", "success", "score"
-]
+tab1, tab2, tab3, tab4 = st.tabs(["粘合度", "放量倍数", "振幅", "20日动量"])
 
-final_df = events[result_cols].sort_values(
-    ["score", "future_return"],
-    ascending=False
-)
+with tab1:
+    result = bucket_analysis(
+        events_model,
+        "compression",
+        bins=[0, 0.03, 0.05, 0.08, 0.12, 1]
+    )
+    st.dataframe(result, use_container_width=True)
 
-total_events = len(final_df)
-success_events = final_df["success"].sum()
-success_rate = success_events / total_events
+with tab2:
+    result = bucket_analysis(
+        events_model,
+        "volume_ratio",
+        bins=[0, 1, 1.5, 2, 3, 5, 100]
+    )
+    st.dataframe(result, use_container_width=True)
 
-col1, col2, col3 = st.columns(3)
-col1.metric("事件总数", total_events)
-col2.metric("60日涨幅超过目标次数", int(success_events))
-col3.metric("成功率", f"{success_rate:.2%}")
+with tab3:
+    result = bucket_analysis(
+        events_model,
+        "amplitude",
+        bins=[0, 3, 5, 8, 12, 20, 100]
+    )
+    st.dataframe(result, use_container_width=True)
 
-st.dataframe(final_df, use_container_width=True)
+with tab4:
+    result = bucket_analysis(
+        events_model,
+        "return_20d",
+        bins=[-1, -0.2, -0.1, 0, 0.1, 0.2, 1]
+    )
+    st.dataframe(result, use_container_width=True)
 
-st.subheader("Top 20 候选事件")
+st.subheader("五、建模分析")
+
+if len(events_model) >= 30 and events_model["success_int"].nunique() == 2:
+    X = events_model[feature_cols]
+    y = events_model["success_int"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.30, random_state=42, stratify=y
+    )
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    logit = LogisticRegression(max_iter=1000)
+    logit.fit(X_train_scaled, y_train)
+
+    logit_pred = logit.predict(X_test_scaled)
+    logit_prob = logit.predict_proba(X_test_scaled)[:, 1]
+
+    rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=5,
+        random_state=42,
+        class_weight="balanced"
+    )
+    rf.fit(X_train, y_train)
+
+    rf_pred = rf.predict(X_test)
+    rf_prob = rf.predict_proba(X_test)[:, 1]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("Logistic Regression")
+        st.metric("Accuracy", f"{accuracy_score(y_test, logit_pred):.2%}")
+        st.metric("ROC-AUC", f"{roc_auc_score(y_test, logit_prob):.3f}")
+
+        coef_df = pd.DataFrame({
+            "因子": feature_cols,
+            "系数": logit.coef_[0]
+        }).sort_values("系数", ascending=False)
+
+        st.dataframe(coef_df, use_container_width=True)
+
+    with col2:
+        st.write("Random Forest")
+        st.metric("Accuracy", f"{accuracy_score(y_test, rf_pred):.2%}")
+        st.metric("ROC-AUC", f"{roc_auc_score(y_test, rf_prob):.3f}")
+
+        importance_df = pd.DataFrame({
+            "因子": feature_cols,
+            "重要性": rf.feature_importances_
+        }).sort_values("重要性", ascending=False)
+
+        st.dataframe(importance_df, use_container_width=True)
+
+        fig_imp = go.Figure()
+        fig_imp.add_trace(go.Bar(x=importance_df["因子"], y=importance_df["重要性"]))
+        fig_imp.update_layout(height=450, title="Random Forest 因子重要性")
+        st.plotly_chart(fig_imp, use_container_width=True)
+
+else:
+    st.warning("建模样本不足。至少需要30个事件，并且成功/失败样本都要有。")
+
+st.subheader("六、Top 20 候选事件")
+
 st.dataframe(final_df.head(20), use_container_width=True)
-
-st.subheader("不同粘合等级成功率")
-
-group_df = final_df.groupby("compression_level").agg(
-    事件数量=("success", "count"),
-    成功数量=("success", "sum"),
-    平均未来最大涨幅=("future_return", "mean"),
-    平均评分=("score", "mean")
-).reset_index()
-
-group_df["成功率"] = group_df["成功数量"] / group_df["事件数量"]
-
-st.dataframe(group_df, use_container_width=True)
 
 csv = final_df.to_csv(index=False).encode("utf-8-sig")
 
 st.download_button(
-    label="下载历史事件CSV",
+    label="下载V4事件研究结果CSV",
     data=csv,
-    file_name="a_share_ma_compression_events_v3.csv",
+    file_name="a_share_ma_compression_events_v4.csv",
     mime="text/csv"
-)   
+)
