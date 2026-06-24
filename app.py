@@ -5,7 +5,6 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from tqdm import tqdm
 
 st.set_page_config(page_title="A股均线粘合突破选股平台", layout="wide")
 
@@ -24,28 +23,37 @@ volume_multiplier = st.sidebar.slider("放量倍数", 1.0, 5.0, 1.8, 0.1)
 turnover_threshold = st.sidebar.slider("最低换手率", 0.0, 20.0, 3.0, 0.5)
 future_days = st.sidebar.slider("未来观察天数", 20, 120, 60, 5)
 target_return = st.sidebar.slider("目标涨幅", 0.10, 1.50, 0.50, 0.05)
-
 max_stocks = st.sidebar.slider("最多扫描股票数量", 50, 5000, 300, 50)
 
 run_scan = st.sidebar.button("开始扫描")
+
 
 # =========================
 # 工具函数
 # =========================
 
+def normalize_code(code):
+    code = str(code).strip()
+    code = code.replace("SZ:", "").replace("SH:", "").replace("sz", "").replace("sh", "")
+    return code.zfill(6)
+
+
 @st.cache_data(show_spinner=False)
 def get_stock_list():
     df = ak.stock_info_a_code_name()
     df.columns = ["code", "name"]
+    df["code"] = df["code"].astype(str).str.zfill(6)
 
-    # 剔除 ST、*ST、退市
     df = df[~df["name"].str.contains("ST|退|退市", na=False)]
+    df = df.reset_index(drop=True)
     return df
 
 
 @st.cache_data(show_spinner=False)
 def get_daily_data(code, start_date, end_date):
     try:
+        code = normalize_code(code)
+
         df = ak.stock_zh_a_hist(
             symbol=code,
             period="daily",
@@ -73,16 +81,25 @@ def get_daily_data(code, start_date, end_date):
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values("date").reset_index(drop=True)
 
+        numeric_cols = [
+            "open", "close", "high", "low", "volume", "amount",
+            "amplitude", "pct_change", "turnover"
+        ]
+
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=["close"])
         return df
 
     except Exception:
         return pd.DataFrame()
 
 
-def calculate_indicators(df):
-    ma_list = [5, 10, 20, 30, 60, 120]
+def calculate_indicators(df, future_days, target_return):
+    df = df.copy()
 
-    for ma in ma_list:
+    for ma in [5, 10, 20, 30, 60, 120]:
         df[f"MA{ma}"] = df["close"].rolling(ma).mean()
 
     ma_cols = ["MA5", "MA10", "MA20", "MA30", "MA60"]
@@ -90,19 +107,23 @@ def calculate_indicators(df):
     df["ma_max"] = df[ma_cols].max(axis=1)
     df["ma_min"] = df[ma_cols].min(axis=1)
 
-    # 均线粘合度
     df["compression"] = (df["ma_max"] - df["ma_min"]) / df["close"]
 
-    # 成交量放大倍数
     df["volume_ma20"] = df["volume"].rolling(20).mean()
     df["volume_ratio"] = df["volume"] / df["volume_ma20"]
 
-    # 突破条件
     df["break_ma60"] = df["close"] > df["MA60"]
     df["break_20d_high"] = df["close"] >= df["high"].rolling(20).max()
 
-    # 未来收益
-    df["future_max_close"] = df["close"].shift(-1).rolling(window=future_days).max().shift(-(future_days - 1))
+    future_max = (
+        df["close"]
+        .shift(-1)
+        .rolling(window=future_days)
+        .max()
+        .shift(-(future_days - 1))
+    )
+
+    df["future_max_close"] = future_max
     df["future_return"] = df["future_max_close"] / df["close"] - 1
     df["success"] = df["future_return"] >= target_return
 
@@ -110,6 +131,8 @@ def calculate_indicators(df):
 
 
 def classify_compression(x):
+    if pd.isna(x):
+        return "无数据"
     if x <= 0.03:
         return "S级超级粘合"
     elif x <= 0.05:
@@ -121,7 +144,7 @@ def classify_compression(x):
 
 
 def find_events(df, code, name):
-    df = calculate_indicators(df)
+    df = calculate_indicators(df, future_days, target_return)
 
     condition = (
         (df["compression"] <= compression_threshold) &
@@ -153,7 +176,6 @@ def find_events(df, code, name):
 def calculate_score(row):
     score = 0
 
-    # 均线粘合度：越低越好
     if row["compression"] <= 0.03:
         score += 30
     elif row["compression"] <= 0.05:
@@ -161,7 +183,6 @@ def calculate_score(row):
     elif row["compression"] <= 0.08:
         score += 15
 
-    # 放量
     if row["volume_ratio"] >= 3:
         score += 25
     elif row["volume_ratio"] >= 2:
@@ -169,7 +190,6 @@ def calculate_score(row):
     elif row["volume_ratio"] >= 1.5:
         score += 12
 
-    # 换手率
     if 3 <= row["turnover"] <= 12:
         score += 20
     elif row["turnover"] > 12:
@@ -177,13 +197,11 @@ def calculate_score(row):
     elif row["turnover"] > 1:
         score += 8
 
-    # 振幅
     if 3 <= row["amplitude"] <= 10:
         score += 15
     elif row["amplitude"] > 10:
         score += 8
 
-    # 当日涨幅
     if 2 <= row["pct_change"] <= 8:
         score += 10
     elif row["pct_change"] > 8:
@@ -196,6 +214,12 @@ def calculate_score(row):
 # 主程序
 # =========================
 
+end_date = datetime.today()
+start_date = end_date - timedelta(days=365 * years)
+
+start_str = start_date.strftime("%Y%m%d")
+end_str = end_date.strftime("%Y%m%d")
+
 stock_list = get_stock_list()
 
 st.subheader("A股股票池")
@@ -203,11 +227,6 @@ st.write(f"剔除 ST、退市后股票数量：{len(stock_list)}")
 
 sample_stock = st.text_input("单股分析代码，例如 000725", "000725")
 
-end_date = datetime.today()
-start_date = end_date - timedelta(days=365 * years)
-
-start_str = start_date.strftime("%Y%m%d")
-end_str = end_date.strftime("%Y%m%d")
 
 # =========================
 # 单股分析
@@ -216,10 +235,11 @@ end_str = end_date.strftime("%Y%m%d")
 st.subheader("单股均线粘合分析")
 
 if sample_stock:
+    sample_stock = normalize_code(sample_stock)
     df_single = get_daily_data(sample_stock, start_str, end_str)
 
     if not df_single.empty:
-        df_single = calculate_indicators(df_single)
+        df_single = calculate_indicators(df_single, future_days, target_return)
 
         latest = df_single.iloc[-1]
 
@@ -261,13 +281,15 @@ if sample_stock:
 
         recent = df_single.tail(120)[[
             "date", "close", "MA5", "MA10", "MA20", "MA30", "MA60",
-            "compression", "volume_ratio", "turnover", "amplitude"
+            "compression", "volume_ratio", "turnover", "amplitude",
+            "future_return", "success"
         ]]
 
         st.dataframe(recent.sort_values("date", ascending=False), use_container_width=True)
 
     else:
         st.warning("没有获取到该股票数据。")
+
 
 # =========================
 # 全市场扫描
@@ -278,12 +300,12 @@ st.subheader("全市场历史事件扫描")
 if run_scan:
     results = []
 
-    scan_list = stock_list.head(max_stocks)
+    scan_list = stock_list.head(max_stocks).reset_index(drop=True)
 
     progress = st.progress(0)
     status = st.empty()
 
-    for i, row in scan_list.iterrows():
+    for idx, row in scan_list.iterrows():
         code = row["code"]
         name = row["name"]
 
@@ -297,7 +319,10 @@ if run_scan:
             if not event_df.empty:
                 results.append(event_df)
 
-        progress.progress((i + 1) / len(scan_list))
+        progress.progress((idx + 1) / len(scan_list))
+
+    progress.empty()
+    status.empty()
 
     if results:
         final_df = pd.concat(results, ignore_index=True)
@@ -325,7 +350,8 @@ if run_scan:
         group_df = final_df.groupby("compression_level").agg(
             事件数量=("success", "count"),
             成功数量=("success", "sum"),
-            平均未来最大涨幅=("future_return", "mean")
+            平均未来最大涨幅=("future_return", "mean"),
+            平均评分=("score", "mean")
         ).reset_index()
 
         group_df["成功率"] = group_df["成功数量"] / group_df["事件数量"]
