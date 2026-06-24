@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="A股均线粘合突破选股平台", layout="wide")
 
 st.title("A股均线粘合突破选股平台 V1")
-st.caption("逻辑：均线粘合 = 市场成本趋同；放量突破后观察未来60日是否涨幅超过50%。")
+st.caption("均线粘合 → 放量突破 → 统计未来60个交易日最大涨幅是否超过50%。")
 
 # =========================
 # 参数区
@@ -23,7 +23,7 @@ volume_multiplier = st.sidebar.slider("放量倍数", 1.0, 5.0, 1.8, 0.1)
 turnover_threshold = st.sidebar.slider("最低换手率", 0.0, 20.0, 3.0, 0.5)
 future_days = st.sidebar.slider("未来观察天数", 20, 120, 60, 5)
 target_return = st.sidebar.slider("目标涨幅", 0.10, 1.50, 0.50, 0.05)
-max_stocks = st.sidebar.slider("最多扫描股票数量", 50, 5000, 300, 50)
+max_stocks = st.sidebar.slider("最多扫描股票数量", 10, 500, 100, 10)
 
 run_scan = st.sidebar.button("开始扫描")
 
@@ -34,19 +34,42 @@ run_scan = st.sidebar.button("开始扫描")
 
 def normalize_code(code):
     code = str(code).strip()
-    code = code.replace("SZ:", "").replace("SH:", "").replace("sz", "").replace("sh", "")
+    code = code.replace("SZ:", "").replace("SH:", "")
+    code = code.replace("sz", "").replace("sh", "")
     return code.zfill(6)
 
 
 @st.cache_data(show_spinner=False)
 def get_stock_list():
-    df = ak.stock_info_a_code_name()
-    df.columns = ["code", "name"]
-    df["code"] = df["code"].astype(str).str.zfill(6)
+    try:
+        df = ak.stock_info_a_code_name()
+        df.columns = ["code", "name"]
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        df = df[~df["name"].str.contains("ST|退|退市", na=False)]
+        df = df.reset_index(drop=True)
+        return df, "akshare"
 
-    df = df[~df["name"].str.contains("ST|退|退市", na=False)]
-    df = df.reset_index(drop=True)
-    return df
+    except Exception:
+        fallback_stocks = [
+            ["000725", "京东方A"],
+            ["000333", "美的集团"],
+            ["000651", "格力电器"],
+            ["002415", "海康威视"],
+            ["002594", "比亚迪"],
+            ["300750", "宁德时代"],
+            ["300059", "东方财富"],
+            ["300124", "汇川技术"],
+            ["600519", "贵州茅台"],
+            ["600036", "招商银行"],
+            ["601318", "中国平安"],
+            ["601012", "隆基绿能"],
+            ["601899", "紫金矿业"],
+            ["603259", "药明康德"],
+            ["688981", "中芯国际"],
+        ]
+
+        df = pd.DataFrame(fallback_stocks, columns=["code", "name"])
+        return df, "fallback"
 
 
 @st.cache_data(show_spinner=False)
@@ -115,7 +138,7 @@ def calculate_indicators(df, future_days, target_return):
     df["break_ma60"] = df["close"] > df["MA60"]
     df["break_20d_high"] = df["close"] >= df["high"].rolling(20).max()
 
-    future_max = (
+    df["future_max_close"] = (
         df["close"]
         .shift(-1)
         .rolling(window=future_days)
@@ -123,7 +146,6 @@ def calculate_indicators(df, future_days, target_return):
         .shift(-(future_days - 1))
     )
 
-    df["future_max_close"] = future_max
     df["future_return"] = df["future_max_close"] / df["close"] - 1
     df["success"] = df["future_return"] >= target_return
 
@@ -220,10 +242,14 @@ start_date = end_date - timedelta(days=365 * years)
 start_str = start_date.strftime("%Y%m%d")
 end_str = end_date.strftime("%Y%m%d")
 
-stock_list = get_stock_list()
+stock_list, source = get_stock_list()
 
 st.subheader("A股股票池")
-st.write(f"剔除 ST、退市后股票数量：{len(stock_list)}")
+
+if source == "akshare":
+    st.success(f"股票池加载成功：{len(stock_list)} 只，已剔除 ST、退市股。")
+else:
+    st.warning("AkShare 股票列表接口连接失败，当前使用备用股票池。日线接口如果也失败，建议后续改成本地CSV上传版。")
 
 sample_stock = st.text_input("单股分析代码，例如 000725", "000725")
 
@@ -288,7 +314,7 @@ if sample_stock:
         st.dataframe(recent.sort_values("date", ascending=False), use_container_width=True)
 
     else:
-        st.warning("没有获取到该股票数据。")
+        st.warning("没有获取到该股票日线数据。可能是 AkShare 数据源在 Streamlit Cloud 上被阻挡。")
 
 
 # =========================
@@ -368,4 +394,4 @@ if run_scan:
         )
 
     else:
-        st.warning("没有扫描到符合条件的事件，可以放宽粘合度、成交量或换手率参数。")
+        st.warning("没有扫描到符合条件的事件。可以放宽粘合度、放量倍数或换手率参数。")
